@@ -9,9 +9,9 @@ struct EthHdr final {
 	Mac smac_;
 	uint16_t type_;
 
-	Mac dmac() { return dmac_; }
-	Mac smac() { return smac_; }
-	uint16_t type() { return ntohs(type_); }
+	Mac dmac() const { return dmac_; }
+	Mac smac() const { return smac_; }
+	uint16_t type() const { return ntohs(type_); }
 
 	// Type(type_)
 	enum: uint16_t {

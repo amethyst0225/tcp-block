@@ -8,29 +8,30 @@
 // Mac
 // ----------------------------------------------------------------------------
 struct Mac final {
-	static constexpr int SIZE = 6;
+	static constexpr int Size = 6;
+    static const size_t SIZE = 6; // MAC address size in bytes
 
 	// constructor
 	Mac() {}
-	Mac(const Mac& r) { memcpy(this->mac_, r.mac_, SIZE); }
-	Mac(const uint8_t* r) { memcpy(this->mac_, r, SIZE); }
+	Mac(const Mac& r) { memcpy(this->mac_, r.mac_, Size); }
+	Mac(const uint8_t* r) { memcpy(this->mac_, r, Size); }
 	Mac(const std::string& r);
 
 	// assign operator
-	Mac& operator = (const Mac& r) { memcpy(this->mac_, r.mac_, SIZE); return *this; }
+	Mac& operator = (const Mac& r) { memcpy(this->mac_, r.mac_, Size); return *this; }
 
 	// casting operator
 	explicit operator uint8_t*() const { return const_cast<uint8_t*>(mac_); }
 	explicit operator std::string() const;
 
 	// comparison operator
-	bool operator == (const Mac& r) const { return memcmp(mac_, r.mac_, SIZE) == 0; }
-	bool operator != (const Mac& r) const { return memcmp(mac_, r.mac_, SIZE) != 0; }
-	bool operator < (const Mac& r) const { return memcmp(mac_, r.mac_, SIZE) < 0; }
-	bool operator > (const Mac& r) const { return memcmp(mac_, r.mac_, SIZE) > 0; }
-	bool operator <= (const Mac& r) const { return memcmp(mac_, r.mac_, SIZE) <= 0; }
-	bool operator >= (const Mac& r) const { return memcmp(mac_, r.mac_, SIZE) >= 0; }
-	bool operator == (const uint8_t* r) const { return memcmp(mac_, r, SIZE) == 0; }
+	bool operator == (const Mac& r) const { return memcmp(mac_, r.mac_, Size) == 0; }
+	bool operator != (const Mac& r) const { return memcmp(mac_, r.mac_, Size) != 0; }
+	bool operator < (const Mac& r) const { return memcmp(mac_, r.mac_, Size) < 0; }
+	bool operator > (const Mac& r) const { return memcmp(mac_, r.mac_, Size) > 0; }
+	bool operator <= (const Mac& r) const { return memcmp(mac_, r.mac_, Size) <= 0; }
+	bool operator >= (const Mac& r) const { return memcmp(mac_, r.mac_, Size) >= 0; }
+	bool operator == (const uint8_t* r) const { return memcmp(mac_, r, Size) == 0; }
 
 	void clear() {
 		*this = nullMac();
@@ -53,14 +54,14 @@ struct Mac final {
 	static Mac& broadcastMac();
 
 protected:
-	uint8_t mac_[SIZE];
+	uint8_t mac_[Size];
 };
 
 namespace std {
 	template<>
 	struct hash<Mac> {
 		size_t operator() (const Mac& r) const {
-			return std::_Hash_impl::hash(&r, Mac::SIZE);
+			return std::_Hash_impl::hash(&r, Mac::Size);
 		}
 	};
 }

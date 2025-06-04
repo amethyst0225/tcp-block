@@ -7,7 +7,7 @@ Mac::Mac(const std::string& r) {
 			s += ch;
 	}
 	int res = sscanf(s.c_str(), "%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx", &mac_[0], &mac_[1], &mac_[2], &mac_[3], &mac_[4], &mac_[5]);
-	if (res != SIZE) {
+	if (res != Size) {
 		fprintf(stderr, "Mac::Mac sscanf return %d r=%s\n", res, r.c_str());
 		return;
 	}
@@ -21,7 +21,7 @@ Mac::operator std::string() const {
 
 Mac Mac::randomMac() {
 	Mac res;
-	for (int i = 0; i < SIZE; i++)
+	for (int i = 0; i < Size; i++)
 		res.mac_[i] = uint8_t(rand() % 256);
 	res.mac_[0] &= 0x7F;
 	return res;
@@ -65,8 +65,8 @@ TEST(Mac, castingTest) {
 	Mac mac("001122-334455");
 
 	const uint8_t* uc = (uint8_t*)mac; // operator uint8_t*()
-	uint8_t temp[Mac::SIZE];
-	for (int i = 0; i < Mac::SIZE; i++)
+	uint8_t temp[Mac::Size];
+	for (int i = 0; i < Mac::Size; i++)
 		temp[i] = *uc++;
 	EXPECT_TRUE(memcmp(&mac, temp, 6) == 0);
 

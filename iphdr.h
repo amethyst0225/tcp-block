@@ -13,9 +13,9 @@ struct IpHdr final {
     uint32_t sip_;
     uint32_t dip_;
 
-    Ip sip() { return Ip(ntohl(sip_)); }
-    Ip dip() { return Ip(ntohl(dip_)); }
-    uint16_t header_len() { return ip_hl * 4; }
+    Ip sip() const { return Ip(ntohl(sip_)); }
+    Ip dip() const { return Ip(ntohl(dip_)); }
+    uint16_t header_len() const { return ip_hl * 4; }
 
     // Protocol(ip_protocol)
     enum: uint8_t {
