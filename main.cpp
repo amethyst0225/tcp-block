@@ -4,7 +4,6 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <fstream>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <cstring>
 #include <arpa/inet.h>
@@ -13,177 +12,328 @@
 #include "iphdr.h"
 #include "tcphdr.h"
 
-char mac[18];
+// 인터페이스 MAC 문자열을 저장할 버퍼
+static char mac[18];
 
+// 302 Redirect 페이로드
+static constexpr char REDIRECT_PAYLOAD[] =
+    "HTTP/1.1 302 Found\r\n"
+    "Location: http://warning.or.kr\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: close\r\n"
+    "\r\n";
+
+// pseudo-header 구조체 (TCP 체크섬 계산용)
+struct PseudoHeader {
+    uint32_t source_address;
+    uint32_t dest_address;
+    uint8_t  placeholder;
+    uint8_t  protocol;
+    uint16_t tcp_length;
+};
+
+// 사용법 출력
 void usage() {
-    printf("syntax: tcp-block <interface> <pattern>\n");
-    printf("sample: tcp-block wlan0 \"Host: test.gilgil.net\"\n");
+    std::cout << "syntax: tcp-block <interface> <pattern>\n";
+    std::cout << "sample: tcp-block wlan0 \"Host: test.gilgil.net\"\n";
 }
 
-bool get_s_mac(const char* dev, char* mac) {
+// "/sys/class/net/<dev>/address" 파일에서 MAC 문자열을 읽어오는 함수
+bool get_interface_mac(const char* dev, char* mac_buf) {
     std::ifstream mac_file("/sys/class/net/" + std::string(dev) + "/address");
-    if (!mac_file.is_open()) return false;
-    mac_file >> mac;
+    if (!mac_file.is_open()) {
+        return false;
+    }
+    mac_file >> mac_buf;
     return true;
 }
 
-uint16_t checksum(uint16_t* ptr, int len){
+// 단순 16비트 체크섬 계산 (IP 헤더 등에서 사용)
+static uint16_t checksum16(const uint8_t* data, size_t len) {
     uint32_t sum = 0;
-    uint16_t odd = 0;
-
+    const uint16_t* ptr = reinterpret_cast<const uint16_t*>(data);
     while (len > 1) {
-        sum += *ptr++;
+        sum += ntohs(*ptr++);
+        if (sum & 0x10000) {
+            sum = (sum & 0xFFFF) + 1;
+        }
         len -= 2;
     }
     if (len == 1) {
-        *(uint8_t *)(&odd) = (*(uint8_t *)ptr);
-        sum += odd;
+        uint16_t last = static_cast<uint16_t>(data[len - 1] << 8);
+        sum += ntohs(last);
+        if (sum & 0x10000) {
+            sum = (sum & 0xFFFF) + 1;
+        }
     }
-    if (sum >> 16)
-        sum = (sum & 0xffff) + (sum >> 16);
-    return (uint16_t)~sum;
+    return htons(static_cast<uint16_t>(~sum & 0xFFFF));
 }
 
-void send_packet(pcap_t* handle, const char* dev, EthHdr* eth, IpHdr* ip, TcpHdr* tcp, const char* payload, int recv_len, bool is_forward) {
+// TCP 체크섬 계산: pseudo-header + TCP 헤더 + 페이로드
+static uint16_t compute_tcp_checksum(const IpHdr* ip, const TcpHdr* tcp, const char* payload, int payload_len) {
+    // pseudo-header 생성
+    PseudoHeader psh;
+    psh.source_address = ip->sip_;
+    psh.dest_address   = ip->dip_;
+    psh.placeholder    = 0;
+    psh.protocol       = IPPROTO_TCP;
+    psh.tcp_length     = htons(static_cast<uint16_t>(sizeof(TcpHdr) + payload_len));
+
+    // 버퍼 길이: pseudo-header + TCP 헤더 + 페이로드
+    int psize = sizeof(PseudoHeader) + sizeof(TcpHdr) + payload_len;
+    uint8_t* buf = static_cast<uint8_t*>(malloc(psize));
+    memset(buf, 0, psize);
+
+    // 1) pseudo-header 복사
+    memcpy(buf, &psh, sizeof(PseudoHeader));
+
+    // 2) TCP 헤더 복사
+    memcpy(buf + sizeof(PseudoHeader), tcp, sizeof(TcpHdr));
+
+    // 3) Payload 복사
+    if (payload_len > 0) {
+        memcpy(buf + sizeof(PseudoHeader) + sizeof(TcpHdr), payload, payload_len);
+    }
+
+    // 4) 체크섬 계산
+    uint16_t chk = checksum16(buf, psize);
+    free(buf);
+    return chk;
+}
+
+// 디버그용: 패킷의 이더넷/IP/TCP 헤더와 페이로드를 출력
+static void dump_packet(const uint8_t* packet) {
+    const EthHdr* eth = reinterpret_cast<const EthHdr*>(packet);
+    const IpHdr* ip   = reinterpret_cast<const IpHdr*>(packet + sizeof(EthHdr));
+    const TcpHdr* tcp = reinterpret_cast<const TcpHdr*>(packet + sizeof(EthHdr) + ip->header_len());
+
     int eth_len = sizeof(EthHdr);
-    int ip_len = sizeof(IpHdr);
-    int tcp_len = sizeof(TcpHdr);
-    int payload_len = strlen(payload);
-    int packet_len = eth_len + ip_len + tcp_len + payload_len;
+    int ip_len  = ip->header_len();
+    int tcp_len = tcp->header_len();
+    const char* payload = reinterpret_cast<const char*>(packet + eth_len + ip_len + tcp_len);
+    int payload_len = static_cast<int>(strlen(payload));
 
-    EthHdr new_eth;
-    IpHdr new_ip;
-    TcpHdr new_tcp;
+    printf("=== Ethernet Header ===\n");
+    printf("  DST MAC : %s\n", eth->dmac_.operator std::string().c_str());
+    printf("  SRC MAC : %s\n", eth->smac_.operator std::string().c_str());
+    printf("  Type    : 0x%04x\n", ntohs(eth->type_));
 
-    memcpy(&new_eth, eth, eth_len);
-    if (!is_forward)
-        new_eth.dmac_ = eth->smac_;
+    printf("=== IP Header ===\n");
+    printf("  Version   : %u\n", ip->ip_v);
+    printf("  IHL       : %u bytes\n", ip->header_len());
+    printf("  TotalLen  : %u\n", ntohs(ip->total_length));
+    printf("  TTL       : %u\n", ip->ttl);
+    printf("  Protocol  : %u\n", ip->protocol);
+    printf("  Checksum  : 0x%04x\n", ntohs(ip->checksum));
+    printf("  Src IP    : %s\n", ip->sip().operator std::string().c_str());
+    printf("  Dst IP    : %s\n", ip->dip().operator std::string().c_str());
+
+    printf("=== TCP Header ===\n");
+    printf("  SrcPort   : %u\n", ntohs(tcp->sport_));
+    printf("  DstPort   : %u\n", ntohs(tcp->dport_));
+    printf("  SeqNum    : %u\n", ntohl(tcp->seq_));
+    printf("  AckNum    : %u\n", ntohl(tcp->ack_));
+    printf("  HdrLen    : %u bytes\n", tcp->header_len());
+    printf("  Flags     : URG=%u ACK=%u PSH=%u RST=%u SYN=%u FIN=%u\n",
+           (tcp->flags_ & TcpHdr::URG) >> 5,
+           (tcp->flags_ & TcpHdr::ACK) >> 4,
+           (tcp->flags_ & TcpHdr::PSH) >> 3,
+           (tcp->flags_ & TcpHdr::RST) >> 2,
+           (tcp->flags_ & TcpHdr::SYN) >> 1,
+           (tcp->flags_ & TcpHdr::FIN) >> 0);
+    printf("  Window    : %u\n", ntohs(tcp->win_));
+    printf("  Checksum  : 0x%04x\n", ntohs(tcp->sum_));
+    printf("  UrgPtr    : %u\n", ntohs(tcp->urp_));
+
+    printf("=== Payload (%d bytes) ===\n", payload_len);
+    if (payload_len > 0) {
+        printf("%.*s\n", payload_len, payload);
+    }
+}
+
+// 패킷 조립 및 전송
+//   is_forward == true  : 클라이언트→서버 (RST+ACK)
+//   is_forward == false : 서버→클라이언트 (PSH+ACK + 302 Redirect 페이로드)
+static void send_packet(pcap_t* handle,
+                        const EthHdr* orig_eth,
+                        const IpHdr* orig_ip,
+                        const TcpHdr* orig_tcp,
+                        const char* payload,
+                        int recv_len,
+                        bool is_forward)
+{
+    const int ETH_LEN     = sizeof(EthHdr);
+    const int IP_LEN      = sizeof(IpHdr);
+    const int TCP_LEN     = sizeof(TcpHdr);
+    const int PAYLOAD_LEN = static_cast<int>(strlen(payload));
+    const int PACKET_LEN  = ETH_LEN + IP_LEN + TCP_LEN + PAYLOAD_LEN;
+
+    // 새로운 이더넷 / IP / TCP 헤더
+    EthHdr new_eth = *orig_eth;
+    IpHdr  new_ip  = *orig_ip;
+    TcpHdr new_tcp = *orig_tcp;
+
+    // 1) 이더넷 헤더 설정
+    if (!is_forward) {
+        // 서버→클라이언트: 원래의 클라이언트 MAC(=orig_eth->smac_)을 dst로 설정
+        new_eth.dmac_ = orig_eth->smac_;
+    }
+    // src MAC은 항상 우리 인터페이스 MAC
     new_eth.smac_ = Mac(mac);
 
-    memcpy(&new_ip, ip, ip_len);
+    // 2) IP 헤더 설정
     if (!is_forward) {
-        new_ip.sip_ = ip->dip_;
-        new_ip.dip_ = ip->sip_;
-        new_ip.ttl = 128;
+        // 서버→클라이언트: IP src/dst 뒤집기 + TTL 높이기
+        new_ip.sip_ = orig_ip->dip_;
+        new_ip.dip_ = orig_ip->sip_;
+        new_ip.ttl  = 128;
     }
     new_ip.checksum = 0;
-    new_ip.total_length = htons(ip_len + tcp_len + payload_len);
-    new_ip.checksum = checksum((uint16_t*)&new_ip, ip_len);
+    new_ip.total_length = htons(static_cast<uint16_t>(IP_LEN + TCP_LEN + PAYLOAD_LEN));
+    new_ip.checksum = checksum16(reinterpret_cast<const uint8_t*>(&new_ip), IP_LEN);
 
-    memcpy(&new_tcp, tcp, tcp_len);
+    // 3) TCP 헤더 설정
     if (is_forward) {
+        // 클라이언트→서버: RST+ACK
         new_tcp.flags_ = TcpHdr::RST | TcpHdr::ACK;
-        new_tcp.seq_ = htonl(ntohl(tcp->seq_) + recv_len);
+        new_tcp.seq_   = htonl(ntohl(orig_tcp->seq_) + recv_len);
+        // new_tcp.ack_는 orig_tcp->ack_를 유지
     } else {
-        new_tcp.sport_ = tcp->dport_;
-        new_tcp.dport_ = tcp->sport_;
+        // 서버→클라이언트: PSH+ACK + 302 Redirect 페이로드
+        new_tcp.sport_ = orig_tcp->dport_;
+        new_tcp.dport_ = orig_tcp->sport_;
         new_tcp.flags_ = TcpHdr::PSH | TcpHdr::ACK;
-        new_tcp.seq_ = tcp->ack_;
-        new_tcp.ack_ = htonl(ntohl(tcp->seq_) + recv_len);
+        new_tcp.seq_   = orig_tcp->ack_;
+        new_tcp.ack_   = htonl(ntohl(orig_tcp->seq_) + recv_len);
     }
-    new_tcp.hlen_ = (sizeof(TcpHdr) / 4) << 4;
-    new_tcp.win_ = htons(1024);
-    new_tcp.urp_ = 0;
-    new_tcp.sum_ = 0;
+    new_tcp.hlen_ = static_cast<uint8_t>((TCP_LEN / 4) << 4);
+    new_tcp.win_  = htons(1024);
+    new_tcp.urp_  = 0;
+    new_tcp.sum_  = 0;
+    // pseudo-header 포함 TCP 체크섬 계산
+    new_tcp.sum_ = compute_tcp_checksum(&new_ip, &new_tcp, payload, PAYLOAD_LEN);
 
-    struct pseudo_header {
-        uint32_t source_address;
-        uint32_t dest_address;
-        uint8_t placeholder;
-        uint8_t protocol;
-        uint16_t tcp_length;
-    } psh;
+    // 4) 전체 패킷 메모리 할당 및 복사
+    uint8_t* packet = static_cast<uint8_t*>(malloc(PACKET_LEN));
+    memcpy(packet,                       &new_eth, ETH_LEN);
+    memcpy(packet + ETH_LEN,             &new_ip,  IP_LEN);
+    memcpy(packet + ETH_LEN + IP_LEN,    &new_tcp, TCP_LEN);
+    if (PAYLOAD_LEN > 0) {
+        memcpy(packet + ETH_LEN + IP_LEN + TCP_LEN, payload, PAYLOAD_LEN);
+    }
 
-    psh.source_address = new_ip.sip_;
-    psh.dest_address = new_ip.dip_;
-    psh.placeholder = 0;
-    psh.protocol = IpHdr::TCP;
-    psh.tcp_length = htons(tcp_len + payload_len);
+    // (디버그) 패킷 덤프
+    dump_packet(packet);
 
-    int buffer_len = sizeof(psh) + tcp_len + payload_len;
-    char *buffer = (char *)malloc(buffer_len);
-    memcpy(buffer, &psh, sizeof(psh));
-    memcpy(buffer + sizeof(psh), &new_tcp, tcp_len);
-    memcpy(buffer + sizeof(psh) + tcp_len, payload, payload_len);
-    new_tcp.sum_ = checksum((uint16_t*)buffer, buffer_len);
-
-    char *packet = (char *)malloc(packet_len);
-    memcpy(packet, &new_eth, eth_len);
-    memcpy(packet + eth_len, &new_ip, ip_len);
-    memcpy(packet + eth_len + ip_len, &new_tcp, tcp_len);
-    memcpy(packet + eth_len + ip_len + tcp_len, payload, payload_len);
-
+    // 5) 실제 전송
     if (!is_forward) {
+        // 서버→클라이언트: raw 소켓(IP_HDRINCL)
         int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-        if (sockfd < 0) return;
+        if (sockfd >= 0) {
+            struct sockaddr_in sin{};
+            sin.sin_family      = AF_INET;
+            sin.sin_port        = new_tcp.sport_;
+            sin.sin_addr.s_addr = new_ip.sip_;
 
-        struct sockaddr_in sin;
-        sin.sin_family = AF_INET;
-        sin.sin_port = new_tcp.sport_;
-        sin.sin_addr.s_addr = new_ip.sip_;
-
-        char optval = 0x01;
-        setsockopt(sockfd, IPPROTO_IP, IP_HDRINCL, &optval, sizeof(optval));
-        sendto(sockfd, packet + eth_len, packet_len - eth_len, 0, (struct sockaddr *)&sin, sizeof(sin));
-        close(sockfd);
+            int optval = 1;
+            setsockopt(sockfd, IPPROTO_IP, IP_HDRINCL, &optval, sizeof(optval));
+            sendto(sockfd,
+                   packet + ETH_LEN,
+                   PACKET_LEN - ETH_LEN,
+                   0,
+                   reinterpret_cast<struct sockaddr*>(&sin),
+                   sizeof(sin));
+            close(sockfd);
+        }
     } else {
-        pcap_sendpacket(handle, (const u_char*)packet, packet_len);
+        // 클라이언트→서버: pcap_sendpacket
+        if (pcap_sendpacket(handle, packet, PACKET_LEN) != 0) {
+            fprintf(stderr, "pcap_sendpacket() failed: %s\n", pcap_geterr(handle));
+        }
     }
-    free(buffer);
+
     free(packet);
 }
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
         usage();
-        return -1;
+        return EXIT_FAILURE;
     }
 
-    const char* dev = argv[1];
+    const char* dev     = argv[1];
     const char* pattern = argv[2];
 
-    while (!get_s_mac(dev, mac)) {
-        printf("Failed to get source MAC address\n");
+    // 인터페이스 MAC 읽기
+    while (!get_interface_mac(dev, mac)) {
+        fprintf(stderr, "Failed to read MAC from %s\n", dev);
+        sleep(1);
     }
 
+    // pcap 핸들 열기
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf);
-    if (handle == nullptr) {
-        fprintf(stderr, "pcap_open_live(%s) return nullptr - %s\n", dev, errbuf);
-        return -1;
+    if (!handle) {
+        fprintf(stderr, "pcap_open_live(%s) failed: %s\n", dev, errbuf);
+        return EXIT_FAILURE;
     }
 
     struct pcap_pkthdr* header;
-    const u_char* packet;
+    const u_char* packet_data;
 
+    // 패킷 캡처 루프
     while (true) {
-        int res = pcap_next_ex(handle, &header, &packet);
+        int res = pcap_next_ex(handle, &header, &packet_data);
         if (res == 0) continue;
-        if (res == -1 || res == -2) break;
+        if (res < 0) {
+            fprintf(stderr, "pcap_next_ex() error: %s\n", pcap_geterr(handle));
+            break;
+        }
 
-        EthHdr* eth = (EthHdr*)packet;
+        // 이더넷 헤더
+        const EthHdr* eth = reinterpret_cast<const EthHdr*>(packet_data);
         if (eth->type() != EthHdr::Ip4) continue;
 
-        IpHdr* ip = (IpHdr*)(packet + sizeof(EthHdr));
+        // IP 헤더
+        const IpHdr* ip = reinterpret_cast<const IpHdr*>(packet_data + sizeof(EthHdr));
         if (ip->protocol != IpHdr::TCP) continue;
 
-        TcpHdr* tcp = (TcpHdr*)(packet + sizeof(EthHdr) + ip->header_len());
-        int eth_len = sizeof(EthHdr);
-        int ip_len = ip->header_len();
-        int tcp_len = tcp->header_len();
+        // TCP 헤더 + 페이로드
+        const TcpHdr* tcp = reinterpret_cast<const TcpHdr*>(packet_data + sizeof(EthHdr) + ip->header_len());
+        int eth_len     = sizeof(EthHdr);
+        int ip_len      = ip->header_len();
+        int tcp_len     = tcp->header_len();
         int payload_len = ntohs(ip->total_length) - ip_len - tcp_len;
-        const char* payload = (const char*)(packet + eth_len + ip_len + tcp_len);
+        if (payload_len <= 0) continue;
 
+        const char* payload = reinterpret_cast<const char*>(packet_data + eth_len + ip_len + tcp_len);
+        // GET 요청인지 확인
         if (strncmp(payload, "GET", 3) != 0) continue;
+        // Host 헤더에 패턴이 포함되어 있는지 검사
         if (memmem(payload, payload_len, pattern, strlen(pattern)) == nullptr) continue;
 
-        printf("Blocking %s\n", pattern);
-        send_packet(handle, dev, eth, ip, tcp, "", payload_len, true);
+        printf("=== 사이트 차단: %s ===\n", pattern);
+
+        // (A) 서버→클라이언트: PSH+ACK + 302 Redirect
+        send_packet(handle,
+                    eth,
+                    ip,
+                    tcp,
+                    REDIRECT_PAYLOAD,
+                    payload_len,
+                    /*is_forward=*/ false);
+
+        // (B) 짧은 지연 후 클라이언트→서버: RST+ACK
         usleep(50000);
-        send_packet(handle, dev, eth, ip, tcp, "HTTP/1.1 302 Found\r\nLocation: http://warning.or.kr\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", payload_len, false);
+        send_packet(handle,
+                    eth,
+                    ip,
+                    tcp,
+                    /*payload=*/ "",
+                    payload_len,
+                    /*is_forward=*/ true);
     }
 
     pcap_close(handle);
-    return 0;
+    return EXIT_SUCCESS;
 }
-
