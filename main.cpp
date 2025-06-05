@@ -101,56 +101,6 @@ static uint16_t compute_tcp_checksum(const IpHdr* ip, const TcpHdr* tcp, const c
     return chk;
 }
 
-// 디버그용: 패킷의 이더넷/IP/TCP 헤더와 페이로드를 출력
-static void dump_packet(const uint8_t* packet) {
-    const EthHdr* eth = reinterpret_cast<const EthHdr*>(packet);
-    const IpHdr* ip   = reinterpret_cast<const IpHdr*>(packet + sizeof(EthHdr));
-    const TcpHdr* tcp = reinterpret_cast<const TcpHdr*>(packet + sizeof(EthHdr) + ip->header_len());
-
-    int eth_len = sizeof(EthHdr);
-    int ip_len  = ip->header_len();
-    int tcp_len = tcp->header_len();
-    const char* payload = reinterpret_cast<const char*>(packet + eth_len + ip_len + tcp_len);
-    int payload_len = static_cast<int>(strlen(payload));
-
-    printf("=== Ethernet Header ===\n");
-    printf("  DST MAC : %s\n", eth->dmac_.operator std::string().c_str());
-    printf("  SRC MAC : %s\n", eth->smac_.operator std::string().c_str());
-    printf("  Type    : 0x%04x\n", ntohs(eth->type_));
-
-    printf("=== IP Header ===\n");
-    printf("  Version   : %u\n", ip->ip_v);
-    printf("  IHL       : %u bytes\n", ip->header_len());
-    printf("  TotalLen  : %u\n", ntohs(ip->total_length));
-    printf("  TTL       : %u\n", ip->ttl);
-    printf("  Protocol  : %u\n", ip->protocol);
-    printf("  Checksum  : 0x%04x\n", ntohs(ip->checksum));
-    printf("  Src IP    : %s\n", ip->sip().operator std::string().c_str());
-    printf("  Dst IP    : %s\n", ip->dip().operator std::string().c_str());
-
-    printf("=== TCP Header ===\n");
-    printf("  SrcPort   : %u\n", ntohs(tcp->sport_));
-    printf("  DstPort   : %u\n", ntohs(tcp->dport_));
-    printf("  SeqNum    : %u\n", ntohl(tcp->seq_));
-    printf("  AckNum    : %u\n", ntohl(tcp->ack_));
-    printf("  HdrLen    : %u bytes\n", tcp->header_len());
-    printf("  Flags     : URG=%u ACK=%u PSH=%u RST=%u SYN=%u FIN=%u\n",
-           (tcp->flags_ & TcpHdr::URG) >> 5,
-           (tcp->flags_ & TcpHdr::ACK) >> 4,
-           (tcp->flags_ & TcpHdr::PSH) >> 3,
-           (tcp->flags_ & TcpHdr::RST) >> 2,
-           (tcp->flags_ & TcpHdr::SYN) >> 1,
-           (tcp->flags_ & TcpHdr::FIN) >> 0);
-    printf("  Window    : %u\n", ntohs(tcp->win_));
-    printf("  Checksum  : 0x%04x\n", ntohs(tcp->sum_));
-    printf("  UrgPtr    : %u\n", ntohs(tcp->urp_));
-
-    printf("=== Payload (%d bytes) ===\n", payload_len);
-    if (payload_len > 0) {
-        printf("%.*s\n", payload_len, payload);
-    }
-}
-
 // 패킷 조립 및 전송
 //   is_forward == true  : 클라이언트→서버 (RST+ACK)
 //   is_forward == false : 서버→클라이언트 (PSH+ACK + 302 Redirect 페이로드)
@@ -221,9 +171,6 @@ static void send_packet(pcap_t* handle,
     if (PAYLOAD_LEN > 0) {
         memcpy(packet + ETH_LEN + IP_LEN + TCP_LEN, payload, PAYLOAD_LEN);
     }
-
-    // (디버그) 패킷 덤프
-    dump_packet(packet);
 
     // 5) 실제 전송
     if (!is_forward) {
@@ -323,8 +270,7 @@ int main(int argc, char* argv[]) {
                     payload_len,
                     /*is_forward=*/ false);
 
-        // (B) 짧은 지연 후 클라이언트→서버: RST+ACK
-        usleep(50000);
+        // (B) 클라이언트→서버: RST+ACK
         send_packet(handle,
                     eth,
                     ip,
