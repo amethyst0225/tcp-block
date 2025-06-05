@@ -16,7 +16,7 @@
 static char mac[18];
 
 // 302 Redirect 페이로드
-static constexpr char REDIRECT_PAYLOAD[] =
+static constexpr char redirect_payload[] =
     "HTTP/1.1 302 Found\r\n"
     "Location: http://warning.or.kr\r\n"
     "Content-Length: 0\r\n"
@@ -32,7 +32,6 @@ struct PseudoHeader {
     uint16_t tcp_length;
 };
 
-// 사용법 출력
 void usage() {
     std::cout << "syntax: tcp-block <interface> <pattern>\n";
     std::cout << "sample: tcp-block wlan0 \"Host: test.gilgil.net\"\n";
@@ -48,7 +47,7 @@ bool get_interface_mac(const char* dev, char* mac_buf) {
     return true;
 }
 
-// 단순 16비트 체크섬 계산 (IP 헤더 등에서 사용)
+// 16비트 체크섬 계산 (IP 헤더 등에서 사용)
 static uint16_t checksum16(const uint8_t* data, size_t len) {
     uint32_t sum = 0;
     const uint16_t* ptr = reinterpret_cast<const uint16_t*>(data);
@@ -266,7 +265,7 @@ int main(int argc, char* argv[]) {
                     eth,
                     ip,
                     tcp,
-                    REDIRECT_PAYLOAD,
+                    redirect_payload,
                     payload_len,
                     /*is_forward=*/ false);
 
